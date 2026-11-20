@@ -6,8 +6,11 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
+from migen.genlib.cdc import MultiReg
 
 from litex.gen import *
+
+from litex.soc.interconnect import stream
 
 from litex.soc.cores.clock.common import *
 
@@ -259,4 +262,102 @@ class ECP5DynamicDelay(LiteXModule):
                     NextValue(curr_taps, curr_taps + 1)
                 )
             )
+        )
+
+
+# Lattice / ECP5 Dedicated Clock Select -------------------------------------------------------------
+
+class ECP5ClockMux(LiteXModule):
+    """Select between two continuously running clocks with the ECP5 DCSC.
+
+    The target supplies the two clock signals and optional ready levels, and
+    constrains the output for the faster input. The management clock must be
+    always running. Set `settle_cycles` to cover several periods of both
+    inputs, including the readiness synchronizer delay.
+    """
+    def __init__(self, clk0, clk1, rates, initial_hz, ready0=1, ready1=1, settle_cycles=16):
+        rates = tuple(rates)
+        if len(rates) != 2 or any(type(hz) is not int or not 0 < hz < 2**32 for hz in rates):
+            raise ValueError("DCSC requires two positive 32-bit integer rates in Hz.")
+        if rates[0] == rates[1] or type(initial_hz) is not int or initial_hz not in rates:
+            raise ValueError("DCSC requires distinct rates and a matching initial rate.")
+        if type(settle_cycles) is not int or settle_cycles < 2:
+            raise ValueError("DCSC requires at least two settling cycles.")
+
+        self.rates      = rates
+        self.initial_hz = initial_hz
+        self.clk        = Signal()
+        self.request    = request  = stream.Endpoint([("profile", 1)])
+        self.response   = response = stream.Endpoint([
+            ("profile", 1), ("clock_valid", 1), ("error", 1),
+        ])
+
+        # # #
+
+        selected   = Signal(reset=rates.index(initial_hz))
+        locked0    = Signal()
+        locked1    = Signal()
+        count      = Signal(max=settle_cycles)
+        settled    = Signal(reset=1)
+        valid      = Signal()
+        error      = Signal()
+        both_ready = locked0 & locked1
+
+        self.specials += [
+            MultiReg(ready0, locked0),
+            MultiReg(ready1, locked1),
+            Instance("DCSC",
+                # The ECP5 bitstream writer uses the attribute and the packer
+                # reads the primitive parameter for clock propagation.
+                attr      = {("DCSMODE", "NEG")},
+                p_DCSMODE = "NEG",
+                i_MODESEL = 0,
+                i_CLK0    = clk0,
+                i_CLK1    = clk1,
+                i_SEL0    = ~selected,
+                i_SEL1    = selected,
+                o_DCSOUT  = self.clk,
+            ),
+        ]
+        self.comb += [
+            response.profile.eq(selected),
+            response.clock_valid.eq(valid),
+            response.error.eq(error),
+        ]
+
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            request.ready.eq(1),
+            If(request.valid,
+                If(both_ready,
+                    NextValue(selected, request.profile),
+                    NextValue(settled, 0),
+                    NextValue(count, settle_cycles - 1),
+                    NextState("SETTLE"),
+                ).Else(
+                    NextValue(valid, settled & Mux(selected, locked1, locked0)),
+                    NextValue(error, 1),
+                    NextState("REPLY"),
+                ),
+            ),
+        )
+        fsm.act("SETTLE",
+            If(~both_ready,
+                NextValue(valid, 0),
+                NextValue(error, 1),
+                NextState("REPLY"),
+            ).Elif(count == 0,
+                NextValue(settled, 1),
+                NextValue(valid, 1),
+                NextValue(error, 0),
+                NextState("REPLY"),
+            ).Else(
+                NextValue(count, count - 1),
+            ),
+        )
+        fsm.act("REPLY",
+            response.valid.eq(1),
+            If(response.ready,
+                NextState("IDLE"),
+            ),
         )

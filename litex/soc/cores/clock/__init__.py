@@ -1,3 +1,6 @@
+# Generic
+from litex.soc.cores.clock.runtime import ClockRateControl
+
 # Xilinx
 from litex.soc.cores.clock.xilinx_s6  import S6PLL,  S6DCM
 from litex.soc.cores.clock.xilinx_s7  import S7PLL,  S7MMCM,  S7IDELAYCTRL
@@ -14,7 +17,7 @@ from litex.soc.cores.clock.intel_common    import IntelPLLPhaseStepper
 
 # Lattice
 from litex.soc.cores.clock.lattice_ice40 import iCE40PLL
-from litex.soc.cores.clock.lattice_ecp5  import ECP5PLL, ECP5DynamicDelay
+from litex.soc.cores.clock.lattice_ecp5  import ECP5PLL, ECP5DynamicDelay, ECP5ClockMux
 from litex.soc.cores.clock.lattice_nx    import NXOSCA, NXPLL
 
 # Efinix
