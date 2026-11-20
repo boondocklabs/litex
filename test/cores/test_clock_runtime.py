@@ -4,13 +4,16 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 import unittest
+from unittest.mock import Mock
 
 from migen import Instance, Signal, run_simulation
+from migen.fhdl import verilog
 
+from litex.build.xilinx.vivado import XilinxVivadoToolchain
 from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
-from litex.soc.cores.clock import ClockRateControl, ECP5ClockMux, ECP5ClockMux3
+from litex.soc.cores.clock import ClockRateControl, ECP5ClockMux, ECP5ClockMux3, S7ClockMux
 
 
 class TestClockRateControl(unittest.TestCase):
@@ -149,6 +152,164 @@ class TestClockRateControl(unittest.TestCase):
             yield from response(52_000_000, 0)
 
         run_simulation(dut, stimulus())
+
+
+class TestS7ClockMux(unittest.TestCase):
+    def test_vivado_timing_constraint_targets_only_this_mux(self):
+        for count, names in [(2, "runtime_pair"), (3, "runtime_pair runtime_output")]:
+            with self.subTest(count=count):
+                clocks = tuple(Signal() for _ in range(count))
+                rates = (25_000_000, 100_000_000, 200_000_000)[:count]
+                platform = Mock(toolchain=XilinxVivadoToolchain())
+                S7ClockMux(clocks, rates, initial_hz=rates[0], name="runtime", platform=platform)
+                platform.add_platform_command.assert_called_once()
+                command, = platform.add_platform_command.call_args.args
+                self.assertEqual(command.format(),
+                    "set_false_path -to [get_pins -of_objects "
+                    "[get_cells {" + names + "}] -filter {REF_PIN_NAME == S0 || REF_PIN_NAME == S1}]")
+        platform = Mock(toolchain=object())
+        S7ClockMux(clocks, rates, initial_hz=rates[0], platform=platform)
+        platform.add_platform_command.assert_not_called()
+
+    def test_invalid_configuration(self):
+        clocks = (Signal(), Signal(), Signal())
+        for inputs, rates, initial, options in [
+            (clocks, (25, 100), 25, {}),
+            (clocks[:1], (25,), 25, {}),
+            (clocks, (25, 25, 200), 25, {}),
+            (clocks, (0, 100, 200), 100, {}),
+            (clocks, (25, 100, 2**32), 25, {}),
+            (clocks, (25, 100, 200), 50, {}),
+            (clocks, (25, 100, 200), 25, {"ready": (1,)}),
+            (clocks, (25, 100, 200), 25, {"settle_cycles": 1}),
+        ]:
+            with self.subTest(rates=rates, initial=initial, options=options):
+                with self.assertRaises(ValueError):
+                    S7ClockMux(inputs, rates, initial, **options)
+
+    def test_two_way_controller_and_startup_selection(self):
+        clocks = (Signal(), Signal())
+        rates = (25_000_000, 100_000_000)
+        backend = S7ClockMux(clocks, rates, initial_hz=rates[1], settle_cycles=6)
+        dut = ClockRateControl.from_backend(backend)
+        self.assertIs(dut.clk, backend.clk)
+        fragment = dut.get_fragment()
+        primitive, = [s for s in fragment.specials if isinstance(s, Instance)]
+        self.assertEqual(primitive.of, "BUFGCTRL")
+        self.assertIs(primitive.get_io("I0"), clocks[0])
+        self.assertIs(primitive.get_io("I1"), clocks[1])
+        self.assertIs(primitive.get_io("O"), dut.clk)
+        fragment.specials.remove(primitive)
+
+        def stimulus():
+            self.assertEqual((yield primitive.get_io("S1")), 1)
+            for _ in range(4):
+                yield
+            yield dut.request.hz.eq(rates[0])
+            yield dut.request.valid.eq(1)
+            yield
+            yield dut.request.valid.eq(0)
+            for _ in range(6):
+                self.assertFalse((yield dut.response.valid))
+                yield
+            for _ in range(6):
+                if (yield dut.response.valid):
+                    break
+                yield
+            self.assertTrue((yield dut.response.valid))
+            self.assertEqual((yield primitive.get_io("S1")), 0)
+            self.assertEqual((yield dut.response.hz), rates[0])
+            self.assertFalse((yield dut.response.error))
+
+        run_simulation(fragment, stimulus())
+
+    def test_three_way_cascade_and_lock_loss(self):
+        clocks = tuple(Signal() for _ in range(3))
+        ready = tuple(Signal(reset=1) for _ in clocks)
+        rates = (25_000_000, 100_000_000, 200_000_000)
+        settle_cycles = 8
+        mux = S7ClockMux(clocks, rates, initial_hz=rates[2], ready=ready,
+            settle_cycles=settle_cycles)
+        fragment = mux.get_fragment()
+        inner, = [s for s in fragment.specials if isinstance(s, Instance) and s.get_io("I0") is clocks[0]]
+        outer, = [s for s in fragment.specials if isinstance(s, Instance) and s.get_io("O") is mux.clk]
+        self.assertEqual((inner.of, outer.of), ("BUFGCTRL", "BUFGCTRL"))
+        self.assertIs(outer.get_io("I0"), inner.get_io("O"))
+        self.assertIs(outer.get_io("I1"), clocks[2])
+        fragment.specials.difference_update({inner, outer})
+        select_pair, select_last = inner.get_io("S1"), outer.get_io("S1")
+
+        def request(profile, expected, valid, error=0, check_cascade=False, lose_lock=False):
+            self.assertTrue((yield mux.request.ready))
+            yield mux.request.profile.eq(profile)
+            yield mux.request.valid.eq(1)
+            yield
+            yield mux.request.valid.eq(0)
+            if check_cascade:
+                yield
+                for _ in range(settle_cycles):
+                    self.assertEqual((yield select_pair), profile)
+                    self.assertTrue((yield select_last))
+                    self.assertFalse((yield mux.response.valid))
+                    yield
+                for _ in range(settle_cycles - 1):
+                    self.assertFalse((yield select_last))
+                    self.assertFalse((yield mux.response.valid))
+                    yield
+            if lose_lock:
+                yield
+                yield ready[1].eq(0)
+            for _ in range(32):
+                if (yield mux.response.valid):
+                    break
+                yield
+            else:
+                self.fail("missing clock mux response")
+            for _ in range(3):
+                self.assertTrue((yield mux.response.valid))
+                self.assertFalse((yield mux.request.ready))
+                self.assertEqual((yield mux.response.profile), expected)
+                self.assertEqual((yield mux.response.clock_valid), valid)
+                self.assertEqual((yield mux.response.error), error)
+                yield
+            yield mux.response.ready.eq(1)
+            yield
+            yield mux.response.ready.eq(0)
+            yield
+
+        def stimulus():
+            for _ in range(4):
+                yield
+            yield from request(3, 2, 1, error=1)
+            yield ready[0].eq(0)
+            for _ in range(4):
+                yield
+            yield from request(0, 2, 1, error=1)
+            yield from request(2, 2, 1)
+            yield ready[0].eq(1)
+            for _ in range(4):
+                yield
+            yield from request(1, 1, 1, check_cascade=True)
+            yield from request(0, 1, 0, error=1, lose_lock=True)
+            yield from request(2, 1, 0, error=1)
+            yield ready[1].eq(1)
+            for _ in range(4):
+                yield
+            yield from request(2, 2, 1)
+            yield from request(0, 0, 1, check_cascade=True)
+
+        run_simulation(fragment, stimulus())
+
+    def test_verilog_uses_dedicated_cascade(self):
+        clocks = tuple(Signal() for _ in range(3))
+        rates = (25_000_000, 100_000_000, 200_000_000)
+        mux = S7ClockMux(clocks, rates, initial_hz=rates[2])
+        source = verilog.convert(mux, ios={*clocks, mux.clk}).main_source
+        self.assertEqual(source.count("BUFGCTRL #("), 2)
+        self.assertEqual(source.count('.PRESELECT_I0("TRUE")'), 1)
+        self.assertEqual(source.count('.PRESELECT_I1("TRUE")'), 1)
+        self.assertEqual(source.count(".IGNORE0(1'd0)"), 2)
+        self.assertEqual(source.count(".IGNORE1(1'd0)"), 2)
 
 
 class TestECP5ClockMux(unittest.TestCase):

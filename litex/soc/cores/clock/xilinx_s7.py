@@ -8,9 +8,12 @@
 from math import ceil
 
 from migen import *
+from migen.genlib.cdc import MultiReg
 
 from litex.gen import *
 
+from litex.build.xilinx.vivado import XilinxVivadoToolchain
+from litex.soc.interconnect import stream
 from litex.soc.cores.clock.common import *
 from litex.soc.cores.clock.xilinx_common import *
 
@@ -117,6 +120,162 @@ class S7MMCM(XilinxClocking):
             self.params["p_CLKOUT{}_PHASE".format(n)] = config["clkout{}_phase".format(n)]
             self.params["o_CLKOUT{}".format(n)]       = clkout.clk
         self.specials += Instance("MMCME2_ADV", name=self.name or "", **self.params)
+
+# Xilinx / 7-Series Runtime Clock Mux --------------------------------------------------------------
+
+class S7ClockMux(LiteXModule):
+    """Select two or three running clock profiles using dedicated BUFGCTRLs.
+
+    Use with ClockRateControl.from_backend(). Provide the PLL/MMCM outputs
+    (e.g. create_clkout with buf=None and with_reset=False) and their optional
+    readiness levels. If used, these levels must indicate stable clocks.
+    All sources must run during a switch. The consumer must be quiesced and
+    the management clock must run independently of the mux output.
+
+    Allow several periods of the slowest source in settle_cycles, including
+    readiness synchronization. The platform constrains all source clocks
+    and can place the BUFGCTRLs on adjacent sites for their dedicated cascade.
+    Pass the Vivado platform and a unique name to register the asynchronous
+    select-pin constraint automatically.
+    """
+    def __init__(self, clocks, rates, initial_hz, *, ready=None, settle_cycles=64, name=None, platform=None):
+        clocks, rates = tuple(clocks), tuple(rates)
+        if len(rates) not in (2, 3) or len(clocks) != len(rates):
+            raise ValueError("BUFGCTRL requires two or three clocks and matching rates.")
+        if any(type(hz) is not int or not 0 < hz < 2**32 for hz in rates):
+            raise ValueError("Clock rates must be positive 32-bit integers in Hz.")
+        if len(set(rates)) != len(rates) or type(initial_hz) is not int or initial_hz not in rates:
+            raise ValueError("BUFGCTRL requires distinct rates and a matching initial rate.")
+        if type(settle_cycles) is not int or settle_cycles < 2:
+            raise ValueError("BUFGCTRL requires at least two settling cycles.")
+        ready = (1,) * len(rates) if ready is None else tuple(ready)
+        if len(ready) != len(rates):
+            raise ValueError("Provide one readiness input per clock.")
+        vivado = platform is not None and isinstance(platform.toolchain, XilinxVivadoToolchain)
+        if vivado and not name:
+            raise ValueError("Pass a unique S7ClockMux name when using a Vivado platform.")
+
+        initial = rates.index(initial_hz)
+        width   = (len(rates) - 1).bit_length()
+        cascade = len(rates) == 3
+        self.rates      = rates
+        self.initial_hz = initial_hz
+        self.clk        = Signal()
+        self.request    = request  = stream.Endpoint([("profile", width)])
+        self.response   = response = stream.Endpoint([
+            ("profile", width), ("clock_valid", 1), ("error", 1),
+        ])
+
+        # # #
+
+        select_pair = Signal(reset=initial == 1)
+        select_last = Signal(reset=initial == 2)
+        paired_clk  = Signal() if cascade else self.clk
+        locked      = Array(Signal() for _ in clocks)
+        all_ready   = Reduce("AND", list(locked))
+        requested   = Signal(width)
+        active      = Signal(width, reset=initial)
+        count       = Signal(max=settle_cycles)
+        settled     = Signal(reset=1)
+        valid       = Signal()
+        error       = Signal()
+
+        self.specials += [MultiReg(source, synced) for source, synced in zip(ready, locked)]
+        stages = [("pair", clocks[0], clocks[1], paired_clk, select_pair, initial == 1)]
+        if cascade:
+            stages.append(("output", paired_clk, clocks[2], self.clk, select_last, initial == 2))
+        mux_names = []
+        for stage, clk0, clk1, output, select, initial_input in stages:
+            instance_name = f"{name}_{stage}" if name else ""
+            mux_names.append(instance_name)
+            self.specials += Instance("BUFGCTRL",
+                name           = instance_name,
+                p_INIT_OUT     = 0,
+                p_PRESELECT_I0 = "FALSE" if initial_input else "TRUE",
+                p_PRESELECT_I1 = "TRUE" if initial_input else "FALSE",
+                i_I0           = clk0,
+                i_I1           = clk1,
+                # Use the synchronized select path for glitch-free switching.
+                i_S0           = ~select,
+                i_S1           = select,
+                i_CE0          = 1,
+                i_CE1          = 1,
+                i_IGNORE0      = 0,
+                i_IGNORE1      = 0,
+                o_O            = output,
+            )
+        if vivado:
+            # UG472 permits asynchronous S0/S1 changes with CE asserted and
+            # IGNORE deasserted. The generated clocks and data paths stay timed.
+            cells = " ".join(mux_names)
+            platform.add_platform_command(
+                "set_false_path -to [get_pins -of_objects "
+                "[get_cells {{" + cells + "}}] "
+                "-filter {{REF_PIN_NAME == S0 || REF_PIN_NAME == S1}}]"
+            )
+
+        self.comb += [
+            response.profile.eq(active),
+            response.clock_valid.eq(valid),
+            response.error.eq(error),
+        ]
+        lost_lock = [NextValue(valid, 0), NextValue(error, 1), NextState("REPLY")]
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            request.ready.eq(1),
+            If(request.valid,
+                If(settled & locked[active] & (request.profile == active),
+                    NextValue(valid, 1),
+                    NextValue(error, 0),
+                    NextState("REPLY"),
+                ).Elif(all_ready & (request.profile < len(rates)),
+                    NextValue(requested, request.profile),
+                    NextValue(settled, 0),
+                    NextValue(count, settle_cycles - 1),
+                    If(request.profile == 2,
+                        NextValue(select_last, 1),
+                        NextState("OUTPUT"),
+                    ).Else(
+                        NextValue(select_pair, request.profile[0]),
+                        NextState("PAIR" if cascade else "OUTPUT"),
+                    ),
+                ).Else(
+                    NextValue(valid, settled & locked[active]),
+                    NextValue(error, 1),
+                    NextState("REPLY"),
+                ),
+            ),
+        )
+        if cascade:
+            # Settle the upstream mux before selecting it at the output.
+            fsm.act("PAIR",
+                If(~all_ready,
+                    *lost_lock,
+                ).Elif(count == 0,
+                    NextValue(select_last, 0),
+                    NextValue(count, settle_cycles - 1),
+                    NextState("OUTPUT"),
+                ).Else(
+                    NextValue(count, count - 1),
+                ),
+            )
+        fsm.act("OUTPUT",
+            If(~all_ready,
+                *lost_lock,
+            ).Elif(count == 0,
+                NextValue(active, requested),
+                NextValue(settled, 1),
+                NextValue(valid, 1),
+                NextValue(error, 0),
+                NextState("REPLY"),
+            ).Else(
+                NextValue(count, count - 1),
+            ),
+        )
+        fsm.act("REPLY",
+            response.valid.eq(1),
+            If(response.ready, NextState("IDLE")),
+        )
 
 # Xilinx / 7-Series IDELAY CTRL --------------------------------------------------------------------
 
