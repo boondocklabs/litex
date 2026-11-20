@@ -17,7 +17,7 @@ from litex.soc.cores.clock.intel_common    import IntelPLLPhaseStepper
 
 # Lattice
 from litex.soc.cores.clock.lattice_ice40 import iCE40PLL
-from litex.soc.cores.clock.lattice_ecp5  import ECP5PLL, ECP5DynamicDelay, ECP5ClockMux
+from litex.soc.cores.clock.lattice_ecp5  import ECP5PLL, ECP5DynamicDelay, ECP5ClockMux, ECP5ClockMux3
 from litex.soc.cores.clock.lattice_nx    import NXOSCA, NXPLL
 
 # Efinix

@@ -361,3 +361,158 @@ class ECP5ClockMux(LiteXModule):
                 NextState("IDLE"),
             ),
         )
+
+
+class ECP5ClockMux3(LiteXModule):
+    """Select three rates using a Trellis edge-clock path and one DCSC.
+
+    `edge_clk0` and `edge_clk1` run at twice their corresponding rates.
+    `park_clk` runs at the third rate and drives the output while the
+    edge path changes. The caller quiesces consumers before a request.
+    The target supplies compatible BELs in bridge, sync, buffer, divider
+    order and constrains the source and generated clocks. The management
+    domain must remain running and settling must cover both clock paths.
+    """
+    def __init__(self, edge_clk0, edge_clk1, park_clk, rates, initial_hz, *,
+        bels, edge_ready=1, park_ready=1, settle_cycles=64):
+        rates = tuple(rates)
+        if len(rates) != 3 or any(type(hz) is not int or not 0 < hz < 2**32 for hz in rates):
+            raise ValueError("The mux requires three positive 32-bit integer rates in Hz.")
+        if len(set(rates)) != 3 or type(initial_hz) is not int or initial_hz not in rates:
+            raise ValueError("The mux requires distinct rates and a matching initial rate.")
+        if type(settle_cycles) is not int or settle_cycles < 2:
+            raise ValueError("The mux requires at least two settling cycles.")
+        bridge_bel, sync_bel, buffer_bel, divider_bel = bels
+        initial = rates.index(initial_hz)
+
+        self.rates       = rates
+        self.initial_hz  = initial_hz
+        self.clk         = Signal()
+        self.bridge_clk  = Signal()
+        self.sync_clk    = Signal()
+        self.edge_clk    = Signal()
+        self.divided_clk = Signal()
+        self.request     = request  = stream.Endpoint([("profile", 2)])
+        self.response    = response = stream.Endpoint([
+            ("profile", 2), ("clock_valid", 1), ("error", 1),
+        ])
+
+        # # #
+
+        select_edge = Signal(reset=initial == 1)
+        select_park = Signal(reset=initial == 2)
+        stop_edge   = Signal()
+        edge_locked = Signal()
+        park_locked = Signal()
+        both_ready  = edge_locked & park_locked
+        requested   = Signal(2)
+        active      = Signal(2, reset=initial)
+        count       = Signal(max=settle_cycles)
+        settled     = Signal(reset=1)
+        valid       = Signal()
+        error       = Signal()
+
+        self.specials += [
+            MultiReg(edge_ready, edge_locked),
+            MultiReg(park_ready, park_locked),
+            Instance("ECLKBRIDGECS",
+                attr     = {("BEL", bridge_bel)},
+                i_CLK0   = edge_clk0,
+                i_CLK1   = edge_clk1,
+                i_SEL    = select_edge,
+                o_ECSOUT = self.bridge_clk,
+            ),
+            Instance("ECLKSYNCB",
+                attr    = {("BEL", sync_bel)},
+                i_ECLKI = self.bridge_clk,
+                i_STOP  = stop_edge,
+                o_ECLKO = self.sync_clk,
+            ),
+            Instance("TRELLIS_ECLKBUF",
+                attr    = {("BEL", buffer_bel)},
+                i_ECLKI = self.sync_clk,
+                o_ECLKO = self.edge_clk,
+            ),
+            Instance("CLKDIVF",
+                attr      = {("BEL", divider_bel)},
+                p_DIV     = "2.0",
+                i_ALIGNWD = 0,
+                i_CLKI    = self.edge_clk,
+                i_RST     = stop_edge,
+                o_CDIVX   = self.divided_clk,
+            ),
+            Instance("DCSC",
+                attr      = {("DCSMODE", "NEG")},
+                p_DCSMODE = "NEG",
+                i_MODESEL = 0,
+                i_CLK0    = self.divided_clk,
+                i_CLK1    = park_clk,
+                i_SEL0    = ~select_park,
+                i_SEL1    = select_park,
+                o_DCSOUT  = self.clk,
+            ),
+        ]
+        self.comb += [
+            response.profile.eq(active),
+            response.clock_valid.eq(valid),
+            response.error.eq(error),
+        ]
+
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            request.ready.eq(1),
+            If(request.valid,
+                If(both_ready & (request.profile < len(rates)),
+                    NextValue(requested, request.profile),
+                    NextValue(settled, 0),
+                    NextValue(select_park, 1),
+                    NextValue(count, settle_cycles - 1),
+                    NextState("PARK"),
+                ).Else(
+                    NextValue(valid, settled & Mux(active == 2, park_locked, edge_locked)),
+                    NextValue(error, 1),
+                    NextState("REPLY"),
+                )
+            )
+        )
+        # Keep the DCSC on the park clock until the divider is running again.
+        for state, actions in (
+            ("PARK", [
+                If(requested == 2,
+                    NextState("COMPLETE"),
+                ).Else(
+                    NextValue(stop_edge, 1),
+                    NextState("STOP"),
+                ),
+            ]),
+            ("STOP",   [NextValue(select_edge, requested[0]), NextState("BRIDGE")]),
+            ("BRIDGE", [NextValue(stop_edge, 0), NextState("START")]),
+            ("START",  [NextValue(select_park, 0), NextState("OUTPUT")]),
+            ("OUTPUT", [NextState("COMPLETE")]),
+        ):
+            fsm.act(state,
+                If(~both_ready,
+                    NextValue(stop_edge, 0),
+                    NextValue(valid, 0),
+                    NextValue(error, 1),
+                    NextState("REPLY"),
+                ).Elif(count != 0,
+                    NextValue(count, count - 1),
+                ).Else(
+                    NextValue(count, settle_cycles - 1),
+                    *actions,
+                )
+            )
+        fsm.act("COMPLETE",
+            NextValue(active, requested),
+            NextValue(settled, both_ready),
+            NextValue(valid, both_ready),
+            NextValue(error, ~both_ready),
+            NextState("REPLY"),
+        )
+        fsm.act("REPLY",
+            response.valid.eq(1),
+            If(response.ready,
+                NextState("IDLE"),
+            )
+        )

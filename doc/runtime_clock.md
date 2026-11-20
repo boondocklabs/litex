@@ -82,3 +82,13 @@ cycles to cover several periods of the slower source and readiness
 synchronization. A loss of readiness during a switch invalidates the
 output until a new switch settles with both sources ready. Constrain the
 output for the fastest source.
+
+`ECP5ClockMux3` adds a Trellis edge-clock bridge, synchronizer, buffer and
+divide-by-two stage ahead of the DCSC. Supply the first two source clocks at
+twice their corresponding rates and the third clock at its output rate.
+The DCSC parks on the third source while the edge path changes, so that
+source must remain available during switching. The target supplies a
+compatible set of BEL locations for the bridge, synchronizer, buffer and
+divider and constrains the exposed intermediate clocks. With Yosys
+libraries that lack `TRELLIS_ECLKBUF`, the target supplies its black-box
+declaration.

@@ -10,7 +10,7 @@ from migen import Instance, Signal, run_simulation
 from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
-from litex.soc.cores.clock import ClockRateControl, ECP5ClockMux
+from litex.soc.cores.clock import ClockRateControl, ECP5ClockMux, ECP5ClockMux3
 
 
 class TestClockRateControl(unittest.TestCase):
@@ -212,5 +212,86 @@ class TestECP5ClockMux(unittest.TestCase):
             for _ in range(4):
                 yield
             yield from request(100_000_000, 100_000_000, 0, 8)
+
+        run_simulation(fragment, bench())
+
+
+class TestECP5ClockMux3(unittest.TestCase):
+    def test_parked_edge_switch_and_recovery(self):
+        edge_ready = Signal(reset=1)
+        rates = (12_500_000, 100_000_000, 208_000_000)
+        settle_cycles = 8
+        mux = ECP5ClockMux3(Signal(), Signal(), Signal(), rates, initial_hz=rates[2],
+            bels=("bridge", "sync", "buffer", "divider"),
+            edge_ready=edge_ready, settle_cycles=settle_cycles)
+        fragment = mux.get_fragment()
+        primitives = {s.of: s for s in fragment.specials if isinstance(s, Instance)}
+        self.assertEqual(set(primitives), {"DCSC", "ECLKBRIDGECS", "ECLKSYNCB",
+            "TRELLIS_ECLKBUF", "CLKDIVF"})
+        for primitive in primitives.values():
+            fragment.specials.remove(primitive)
+        select_park = primitives["DCSC"].get_io("SEL1")
+        select_edge = primitives["ECLKBRIDGECS"].get_io("SEL")
+        stop_edge   = primitives["ECLKSYNCB"].get_io("STOP")
+        self.assertIs(primitives["CLKDIVF"].get_io("RST"), stop_edge)
+        self.assertIs(primitives["CLKDIVF"].get_io("CLKI"), mux.edge_clk)
+
+        def request(profile, expected, valid, error, drop_lock=False):
+            assert (yield mux.request.ready)
+            yield mux.request.profile.eq(profile)
+            yield mux.request.valid.eq(1)
+            yield
+            yield mux.request.valid.eq(0)
+            prev_edge = (yield select_edge)
+            prev_stop = (yield stop_edge)
+            released = None
+            for cycle in range(64):
+                edge = (yield select_edge)
+                stop = (yield stop_edge)
+                if edge != prev_edge:
+                    assert prev_stop and stop
+                if stop or edge != prev_edge:
+                    assert (yield select_park)
+                if stop and drop_lock:
+                    yield edge_ready.eq(0)
+                    drop_lock = False
+                if prev_stop and not stop:
+                    released = cycle
+                if released is not None and not (yield select_park):
+                    assert cycle - released >= settle_cycles
+                prev_edge, prev_stop = edge, stop
+                if (yield mux.response.valid):
+                    break
+                yield
+            else:
+                raise AssertionError("missing mux response")
+            for _ in range(3):
+                assert (yield mux.response.valid)
+                assert (yield mux.response.profile) == expected
+                assert (yield mux.response.clock_valid) == valid
+                assert (yield mux.response.error) == error
+                assert not (yield mux.request.ready)
+                yield
+            yield mux.response.ready.eq(1)
+            yield
+            yield mux.response.ready.eq(0)
+            yield
+
+        def bench():
+            for _ in range(4):
+                yield
+            for profile in (0, 1, 0, 2):
+                yield from request(profile, profile, 1, 0)
+                assert (yield select_park) == (profile == 2)
+                if profile != 2:
+                    assert (yield select_edge) == profile
+            yield from request(3, 2, 1, 1)
+            yield from request(1, 2, 0, 1, drop_lock=True)
+            assert not (yield stop_edge)
+            yield from request(2, 2, 0, 1)
+            yield edge_ready.eq(1)
+            for _ in range(4):
+                yield
+            yield from request(1, 1, 1, 0)
 
         run_simulation(fragment, bench())
