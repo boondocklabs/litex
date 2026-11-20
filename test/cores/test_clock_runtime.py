@@ -6,14 +6,15 @@
 import unittest
 from unittest.mock import Mock
 
-from migen import Instance, Signal, run_simulation
+from migen import ClockDomain, Instance, Signal, run_simulation
 from migen.fhdl import verilog
 
 from litex.build.xilinx.vivado import XilinxVivadoToolchain
 from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
-from litex.soc.cores.clock import ClockRateControl, ECP5ClockMux, ECP5ClockMux3, S7ClockMux
+from litex.soc.cores.clock import ClockRateControl, ECP5ClockMux, ECP5ClockMux3
+from litex.soc.cores.clock import S7ClockDRP, S7ClockMux, S7MMCM, S7PLL
 
 
 class TestClockRateControl(unittest.TestCase):
@@ -310,6 +311,191 @@ class TestS7ClockMux(unittest.TestCase):
         self.assertEqual(source.count('.PRESELECT_I1("TRUE")'), 1)
         self.assertEqual(source.count(".IGNORE0(1'd0)"), 2)
         self.assertEqual(source.count(".IGNORE1(1'd0)"), 2)
+
+
+class TestS7ClockDRP(unittest.TestCase):
+    rates = (25_000_000, 100_000_000, 200_000_000)
+    profiles = {
+        25_000_000:  [(0x08, 0xf000, 0x0048)],
+        100_000_000: [(0x08, 0xf000, 0x0104), (0x09, 0xff00, 0x0020)],
+        200_000_000: [(0x08, 0xf000, 0x0082)],
+    }
+
+    def test_fixed_vco_clkout0_profiles(self):
+        profiles = S7ClockDRP.clkout0_divider_profiles(1_200_000_000, (24, 35, 126))
+        self.assertEqual(profiles, {
+            50_000_000: [(0x28, 0x0000, 0xffff), (0x08, 0xf000, 0x030c), (0x09, 0xff3f, 0x0000)],
+            34_285_714: [(0x28, 0x0000, 0xffff), (0x08, 0xf000, 0x0452), (0x09, 0xff3f, 0x0080)],
+             9_523_810: [(0x28, 0x0000, 0xffff), (0x08, 0xf000, 0x0fff), (0x09, 0xff3f, 0x0000)],
+        })
+        for dividers in [(1,), (127,), (24, 24), (24.0,)]:
+            with self.subTest(dividers=dividers), self.assertRaises(ValueError):
+                S7ClockDRP.clkout0_divider_profiles(1_200_000_000, dividers)
+
+    def test_drp_ownership_and_validation(self):
+        clk = Signal()
+        generator = S7MMCM()
+        generator.expose_drp()
+        with self.assertRaisesRegex(ValueError, "already connected"):
+            S7ClockDRP(generator, clk, self.profiles, self.rates[0])
+        generator = S7PLL()
+        S7ClockDRP(generator, clk, self.profiles, self.rates[0])
+        with self.assertRaisesRegex(ValueError, "already connected"):
+            generator.expose_drp()
+        for profiles in ({}, {1: []}, {1: [(0x80, 0, 0)]}, {1: [(0, 0, 0x10000)]}):
+            with self.subTest(profiles=profiles), self.assertRaises(ValueError):
+                S7ClockDRP(S7PLL(), clk, profiles, 1)
+
+    def make_controller(self, generator, primitive):
+        generator.register_clkin(Signal(), 100e6)
+        output = ClockDomain("output", reset_less=True)
+        generator.create_clkout(output, self.rates[0], buf=None, margin=0, with_reset=False)
+        backend = S7ClockDRP(generator, output.clk, self.profiles, self.rates[0],
+            drp_timeout=8, lock_timeout=32)
+        dut = ClockRateControl.from_backend(backend)
+        self.assertIs(dut.clk, output.clk)
+        fragment = dut.get_fragment()
+        fragment.clock_domains.append(ClockDomain("sys"))
+        clock_cell, = [s for s in fragment.specials if isinstance(s, Instance) and s.of == primitive]
+        self.assertIs(clock_cell.get_io("RST"), generator.reset)
+        fragment.specials.remove(clock_cell)
+        # Model the generator's reference-clock reset pipeline on the test
+        # clock, with the clock primitive itself driven by the test bench.
+        for cell in list(fragment.specials):
+            if isinstance(cell, Instance) and cell.of == "FDCE":
+                fragment.sync["sys"].append(cell.get_io("Q").eq(cell.get_io("D")))
+                fragment.specials.remove(cell)
+        return dut, fragment, clock_cell
+
+    def request(self, dut, hz):
+        self.assertTrue((yield dut.request.ready))
+        yield dut.request.hz.eq(hz)
+        yield dut.request.valid.eq(1)
+        yield
+        yield dut.request.valid.eq(0)
+
+    def reply(self, dut, hz, error=0):
+        for _ in range(64):
+            if (yield dut.response.valid):
+                break
+            yield
+        else:
+            self.fail("missing clock response")
+        for _ in range(3):
+            self.assertEqual((yield dut.response.hz), hz)
+            self.assertEqual((yield dut.response.error), error)
+            self.assertFalse((yield dut.request.ready))
+            yield
+        yield dut.response.ready.eq(1)
+        yield
+        yield dut.response.ready.eq(0)
+        yield
+
+    def transfer(self, cell, address, write=None, data=None):
+        den, drdy, do = (cell.get_io(port) for port in ("DEN", "DRDY", "DO"))
+        for _ in range(32):
+            if (yield den):
+                break
+            yield
+        else:
+            self.fail("missing DRP transfer")
+        self.assertTrue((yield cell.get_io("RST")))
+        self.assertEqual((yield cell.get_io("DADDR")), address)
+        self.assertEqual((yield cell.get_io("DWE")), write is not None)
+        if write is not None:
+            self.assertEqual((yield cell.get_io("DI")), write)
+        yield
+        self.assertFalse((yield den))
+        if data is not None:
+            yield do.eq(data)
+        yield drdy.eq(1)
+        yield
+        yield drdy.eq(0)
+
+    def boot_initial_profile(self, dut, cell):
+        yield cell.get_io("LOCKED").eq(0)
+        yield from self.transfer(cell, 0x08, data=0xaabb)
+        yield from self.transfer(cell, 0x08, write=0xa048)
+        for _ in range(16):
+            self.assertFalse((yield dut.backend.request.ready))
+            yield
+        yield cell.get_io("LOCKED").eq(1)
+        for _ in range(16):
+            if (yield dut.backend.request.ready):
+                return
+            yield
+        self.fail("initial DRP profile did not settle")
+
+    def test_mmcm_and_pll_reconfigure_and_relock(self):
+        for generator, primitive in [(S7MMCM, "MMCME2_ADV"), (S7PLL, "PLLE2_ADV")]:
+            with self.subTest(primitive=primitive):
+                dut, fragment, cell = self.make_controller(generator(), primitive)
+
+                def stimulus():
+                    locked = cell.get_io("LOCKED")
+                    yield from self.boot_initial_profile(dut, cell)
+                    yield from self.request(dut, self.rates[1])
+                    for _ in range(16):
+                        yield
+                    self.assertTrue((yield cell.get_io("RST")))
+                    self.assertFalse((yield cell.get_io("DEN")))
+                    yield locked.eq(0)
+                    yield from self.transfer(cell, 0x08, data=0xaabb)
+                    yield from self.transfer(cell, 0x08, write=0xa104)
+                    yield from self.transfer(cell, 0x09, data=0x93ff)
+                    yield from self.transfer(cell, 0x09, write=0x9320)
+                    for _ in range(16):
+                        self.assertFalse((yield dut.response.valid))
+                        yield
+                    self.assertFalse((yield cell.get_io("RST")))
+                    yield locked.eq(1)
+                    yield from self.reply(dut, self.rates[1])
+                    yield from self.request(dut, 50_000_000)
+                    yield from self.reply(dut, self.rates[1], error=1)
+
+                    reset = fragment.clock_domains["sys"].rst
+                    yield reset.eq(1)
+                    yield
+                    yield reset.eq(0)
+                    yield from self.boot_initial_profile(dut, cell)
+                    self.assertEqual((yield dut.active_hz), self.rates[0])
+
+                run_simulation(fragment, stimulus())
+
+    def test_timeout_drains_late_response_and_requires_relock(self):
+        dut, fragment, cell = self.make_controller(S7MMCM(), "MMCME2_ADV")
+
+        def stimulus():
+            yield from self.boot_initial_profile(dut, cell)
+            yield from self.request(dut, self.rates[2])
+            yield cell.get_io("LOCKED").eq(0)
+            yield from self.reply(dut, 0, error=1)
+            self.assertTrue((yield cell.get_io("RST")))
+            yield from self.request(dut, self.rates[0])
+            yield from self.reply(dut, 0, error=1)
+            self.assertFalse((yield cell.get_io("DEN")))
+            yield cell.get_io("DRDY").eq(1)
+            yield
+            yield cell.get_io("DRDY").eq(0)
+            yield
+
+            yield from self.request(dut, self.rates[2])
+            yield from self.transfer(cell, 0x08, data=0x7000)
+            yield from self.transfer(cell, 0x08, write=0x7082)
+            yield from self.reply(dut, 0, error=1)
+            for _ in range(8):
+                yield
+            self.assertTrue((yield cell.get_io("RST")))
+
+            yield from self.request(dut, self.rates[0])
+            yield from self.transfer(cell, 0x08, data=0x7082)
+            yield from self.transfer(cell, 0x08, write=0x7048)
+            for _ in range(16):
+                yield
+            yield cell.get_io("LOCKED").eq(1)
+            yield from self.reply(dut, self.rates[0])
+
+        run_simulation(fragment, stimulus())
 
 
 class TestECP5ClockMux(unittest.TestCase):

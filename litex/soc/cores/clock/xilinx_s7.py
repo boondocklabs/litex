@@ -277,6 +277,234 @@ class S7ClockMux(LiteXModule):
             If(response.ready, NextState("IDLE")),
         )
 
+# Xilinx / 7-Series Runtime DRP --------------------------------------------------------------------
+
+class S7ClockDRP(LiteXModule):
+    """Reprogram an S7MMCM or S7PLL using target-supplied DRP profiles.
+
+    Configure the generator and its output clock before passing them here.
+    This backend owns the generator, its reset, and DRP and loads initial_hz
+    before accepting requests. Constrain the output for the fastest profile.
+    Profiles map Hz to ordered (address, preserve_mask, bits_to_set) tuples
+    in the XAPP888 format. Supply complete tables for the chosen primitive,
+    reference clock and outputs, including any required lock/filter values.
+    A table must be safe to apply after any previous or partial profile.
+
+    Bind with ClockRateControl.from_backend(). The caller must keep all
+    consumers of the generator quiesced through reset and relock and run
+    the FSM from an independent, always-on DCLK within the device limits.
+    The profile request and response use valid/ready in the DCLK domain.
+    Responses may be backpressured. LOCKED and the applied reset are
+    synchronized back to DCLK. The initial table is reapplied at management
+    reset because the DRP registers retain their contents. Timeouts are
+    expressed in DCLK cycles.
+    A failed switch leaves the generator in reset until a new profile can
+    be applied successfully.
+    """
+    def __init__(self, generator, clk, profiles, initial_hz, *, drp_timeout=256, lock_timeout=100_000):
+        if not isinstance(generator, (S7MMCM, S7PLL)):
+            raise ValueError("S7ClockDRP requires an S7MMCM or S7PLL.")
+        if "i_DEN" in generator.params:
+            raise ValueError("The clock generator DRP is already connected.")
+        rates = tuple(profiles)
+        if not rates or any(type(hz) is not int or not 0 < hz < 2**32 for hz in rates):
+            raise ValueError("Clock rates must be positive 32-bit integers in Hz.")
+        if type(initial_hz) is not int or initial_hz not in profiles:
+            raise ValueError("The initial rate must match a DRP profile.")
+        if any(type(timeout) is not int or timeout < 2 for timeout in (drp_timeout, lock_timeout)):
+            raise ValueError("DRP timeouts must be at least two cycles.")
+
+        starts, ends, entries = [], [], []
+        for hz in rates:
+            starts.append(len(entries))
+            for address, preserve, bits in profiles[hz]:
+                if any(type(value) is not int or not 0 <= value < 1 << width
+                       for value, width in [(address, 7), (preserve, 16), (bits, 16)]):
+                    raise ValueError("DRP entries require a 7-bit address and two 16-bit values.")
+                entries.append((bits << 23) | (preserve << 7) | address)
+            if starts[-1] == len(entries):
+                raise ValueError("Each DRP profile must have at least one register entry.")
+            ends.append(len(entries) - 1)
+
+        initial       = rates.index(initial_hz)
+        profile_width = max(1, (len(rates) - 1).bit_length())
+        self.generator  = generator
+        self.clk        = clk
+        self.rates      = rates
+        self.initial_hz = initial_hz
+        self.request    = request  = stream.Endpoint([("profile", profile_width)])
+        self.response   = response = stream.Endpoint([
+            ("profile", profile_width), ("clock_valid", 1), ("error", 1),
+        ])
+
+        # # #
+
+        den, dwe, drdy = Signal(), Signal(), Signal()
+        read_data      = Signal(16)
+        write_data     = Signal(16)
+        index          = Signal(max=max(2, len(entries)))
+        last           = Signal.like(index)
+        entry          = Signal(39)
+        address        = entry[:7]
+        preserve_mask  = entry[7:23]
+        bits_to_set    = entry[23:]
+        timer          = Signal(max=max(drp_timeout, lock_timeout))
+        locked         = Signal()
+        reset_applied  = self._reset_applied = Signal()
+        held           = Signal(reset=1)
+        outstanding    = Signal(reset_less=True)
+        startup        = Signal(reset=1)
+        configured     = Signal()
+        active         = Signal(profile_width, reset=initial)
+        requested      = Signal(profile_width, reset=initial)
+        valid          = Signal()
+        error          = Signal()
+
+        generator.params.update(
+            i_DCLK  = ClockSignal(),
+            i_DEN   = den & ~ResetSignal(),
+            i_DWE   = dwe,
+            i_DADDR = address,
+            i_DI    = write_data,
+            o_DO    = read_data,
+            o_DRDY  = drdy,
+        )
+        self.specials += MultiReg(generator.locked, locked)
+        self.comb += [
+            generator.reset.eq(held | ResetSignal()),
+            entry.eq(Array(Constant(word, 39) for word in entries)[index]),
+            response.profile.eq(active),
+            response.clock_valid.eq(valid),
+            response.error.eq(error),
+        ]
+        # Drain a late response after a timeout before starting another
+        # transfer. DRDY does not carry an address or transaction identifier.
+        self.sync += If(den & ~ResetSignal(),
+            outstanding.eq(1),
+        ).Elif(drdy,
+            outstanding.eq(0),
+        )
+
+        self.fsm = fsm = FSM(reset_state="STARTUP")
+
+        def wait_for(condition, *on_ready):
+            return If(condition, *on_ready).Elif(timer == 0,
+                NextValue(held, 1),
+                NextValue(valid, 0),
+                NextValue(error, 1),
+                NextState("COMPLETE"),
+            ).Else(NextValue(timer, timer - 1))
+
+        fsm.act("STARTUP",
+            NextValue(index, starts[initial]),
+            NextValue(last, ends[initial]),
+            NextValue(timer, lock_timeout - 1),
+            NextState("RESET"),
+        )
+        fsm.act("IDLE",
+            request.ready.eq(1),
+            If(request.valid,
+                If((request.profile < len(rates)) & ~outstanding & ~drdy,
+                    NextValue(requested, request.profile),
+                    NextValue(index, Array(starts)[request.profile]),
+                    NextValue(last, Array(ends)[request.profile]),
+                    NextValue(configured, 0),
+                    NextValue(held, 1),
+                    NextValue(timer, lock_timeout - 1),
+                    NextState("RESET"),
+                ).Else(
+                    NextValue(valid, configured & locked),
+                    NextValue(error, 1),
+                    NextState("REPLY"),
+                ),
+            ),
+        )
+        fsm.act("RESET",
+            wait_for(reset_applied & ~locked & ~outstanding & ~drdy, NextState("READ")),
+        )
+        fsm.act("READ",
+            den.eq(1),
+            NextValue(timer, drp_timeout - 1),
+            NextState("READ_WAIT"),
+        )
+        fsm.act("READ_WAIT",
+            wait_for(drdy,
+                NextValue(write_data, (read_data & preserve_mask) | bits_to_set),
+                NextState("WRITE"),
+            ),
+        )
+        fsm.act("WRITE",
+            den.eq(1),
+            dwe.eq(1),
+            NextValue(timer, drp_timeout - 1),
+            NextState("WRITE_WAIT"),
+        )
+        fsm.act("WRITE_WAIT",
+            wait_for(drdy,
+                If(index == last,
+                    NextValue(held, 0),
+                    NextValue(timer, lock_timeout - 1),
+                    NextState("LOCK"),
+                ).Else(
+                    NextValue(index, index + 1),
+                    NextState("READ"),
+                ),
+            ),
+        )
+        fsm.act("LOCK",
+            wait_for(~reset_applied & locked,
+                NextValue(active, requested),
+                NextValue(configured, 1),
+                NextValue(valid, 1),
+                NextValue(error, 0),
+                NextState("COMPLETE"),
+            ),
+        )
+        fsm.act("COMPLETE",
+            If(startup,
+                NextValue(startup, 0),
+                NextState("IDLE"),
+            ).Else(NextState("REPLY")),
+        )
+        fsm.act("REPLY",
+            response.valid.eq(1),
+            If(response.ready, NextState("IDLE")),
+        )
+
+    def do_finalize(self):
+        # The Xilinx generator adds a reference-clock pipeline to RST when
+        # it finalizes. Observe the actual pin before starting DRP transfers.
+        self.specials += MultiReg(self.generator.reset, self._reset_applied)
+
+    @staticmethod
+    def clkout0_divider_profiles(vco_hz, dividers):
+        """Build fixed-VCO profiles for CLKOUT0 on an S7MMCM or S7PLL.
+
+        Use an integer, zero-phase CLKOUT0 configuration. The reference,
+        feedback, and all other outputs keep their bitstream settings. The
+        caller selects divisors that satisfy the generator and output limits.
+        """
+        if type(vco_hz) is not int or vco_hz <= 0:
+            raise ValueError("The VCO rate must be a positive integer in Hz.")
+
+        profiles = {}
+        for divider in dividers:
+            if type(divider) is not int or not 2 <= divider <= 126:
+                raise ValueError("CLKOUT0 divider must be an integer from 2 through 126.")
+            rate = (vco_hz + divider // 2) // divider
+            if not 0 < rate < 2**32 or rate in profiles:
+                raise ValueError("CLKOUT0 dividers must produce distinct positive 32-bit rates.")
+            high = divider // 2
+            low  = divider - high
+            # XAPP888: PowerReg, CLKOUT0 counts, then EDGE/NO_COUNT. For
+            # odd divides, EDGE moves half a VCO cycle from low to high.
+            profiles[rate] = [
+                (0x28, 0x0000, 0xffff),
+                (0x08, 0xf000, (high << 6) | low),
+                (0x09, 0xff3f, (divider & 1) << 7),
+            ]
+        return profiles
+
 # Xilinx / 7-Series IDELAY CTRL --------------------------------------------------------------------
 
 class S7IDELAYCTRL(LiteXModule):

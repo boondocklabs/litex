@@ -120,6 +120,8 @@ class XilinxClocking(LiteXModule):
         raise pll_config_error(self.clkin_freq, self.clkouts)
 
     def expose_drp(self):
+        if "i_DEN" in self.params:
+            raise ValueError("The clock generator DRP is already connected.")
         self.drp_reset  = CSR()
         self.drp_locked = CSRStatus(1,                    description="DRP PLL/MMCM locked status.")
         self.drp_read   = CSR()

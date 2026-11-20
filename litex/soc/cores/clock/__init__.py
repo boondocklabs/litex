@@ -3,7 +3,7 @@ from litex.soc.cores.clock.runtime import ClockRateControl
 
 # Xilinx
 from litex.soc.cores.clock.xilinx_s6  import S6PLL,  S6DCM
-from litex.soc.cores.clock.xilinx_s7  import S7PLL,  S7MMCM,  S7IDELAYCTRL, S7ClockMux
+from litex.soc.cores.clock.xilinx_s7  import S7PLL,  S7MMCM,  S7IDELAYCTRL, S7ClockMux, S7ClockDRP
 from litex.soc.cores.clock.xilinx_us  import USPLL,  USMMCM,  USIDELAYCTRL
 from litex.soc.cores.clock.xilinx_usp import USPPLL, USPMMCM, USPIDELAYCTRL
 
