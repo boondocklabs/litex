@@ -1,11 +1,13 @@
 import re
 import random
 import unittest
+from unittest.mock import patch
 
 from migen import *
 from migen.fhdl.tools import group_by_targets
 from migen.fhdl.namer import build_namespace
 
+from litex.gen import LiteXContext
 from litex.gen.fhdl.verilog import VerilogTime, convert
 from litex.gen.fhdl.verilog import _group_by_targets, _topological_sort_targets
 
@@ -143,6 +145,21 @@ class TestVerilog(unittest.TestCase):
         self.assertNotRegex(v, r"output wire\s+o")
         self.assertIn("always @(posedge sys_clk) begin", v)
         self.assertIn("o <= i;", v)
+
+    def test_registered_output_startup_value(self):
+        for hierarchical in (False, True):
+            for regs_init in (False, True):
+                with self.subTest(hierarchical=hierarchical, regs_init=regs_init):
+                    dut = _SyncOutput()
+                    comb = Signal(name="comb", reset=1)
+                    dut.comb += If(dut.i, comb.eq(0))
+                    with patch.object(LiteXContext, "top", dut):
+                        v = convert(dut, ios={dut.clk, dut.i, dut.o, comb},
+                            hierarchical=hierarchical, regs_init=regs_init).main_source
+
+                    init = " = 1'd1" if regs_init else ""
+                    self.assertRegex(v, rf"output reg\s+o{init}\s*[,)]")
+                    self.assertRegex(v, r"output reg\s+comb\s*[,)]")
 
     def test_display_can_emit_verilog_time(self):
         dut = _DisplayTime()

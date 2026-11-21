@@ -382,47 +382,24 @@ def _list_comb_wires(f):
             r |= g[0]
     return r
 
-def _generate_module(f, ios, name, ns, attr_translate):
-    sigs         = list_signals(f) | list_special_ios(f, ins=True, outs=True, inouts=True)
-    special_outs = list_special_ios(f, ins=False, outs=True,  inouts=True)
+def _generate_module(f, ios, name, ns, attr_translate, regs_init):
+    special_outs = list_special_ios(f, ins=False, outs=True, inouts=True)
     inouts       = list_special_ios(f, ins=False, outs=False, inouts=True)
     targets      = list_targets(f) | special_outs
     wires        = _list_comb_wires(f) | special_outs
-    mem_signals, mem_targets, mem_wires = _collect_memory_port_signals(f.specials, f.clock_domains)
-    sigs    |= mem_signals
+    _, mem_targets, mem_wires = _collect_memory_port_signals(f.specials, f.clock_domains)
     targets |= mem_targets
     wires   |= mem_wires
 
-    r = f"module {name} (\n"
-    firstp = True
-    for sig in sorted(ios, key=lambda x: ns.get_name(x)):
-        if not firstp:
-            r += ",\n"
-        firstp = False
-        attr = _generate_attribute(sig.attr, attr_translate)
-        if attr:
-            r += _tab + attr
-        sig.type = "wire"
-        sig.name = ns.get_name(sig)
-        sig.port = True
-        if sig in inouts:
-            sig.direction = "inout"
-            r += _tab + "inout  wire " + _generate_signal(ns, sig)
-        elif sig in targets:
-            sig.direction = "output"
-            if sig in wires:
-                r += _tab + "output wire " + _generate_signal(ns, sig)
-            else:
-                sig.type = "reg"
-                r += _tab + "output reg  " + _generate_signal(ns, sig)
-        else:
-            sig.direction = "input"
-            r += _tab + "input  wire " + _generate_signal(ns, sig)
-    r += "\n);\n\n"
+    directions = {sig: "output" for sig in targets}
+    directions.update({sig: "inout" for sig in inouts})
+    return _generate_module_with_ports(f, ios, name, ns, attr_translate, directions, wires, regs_init)
 
-    return r
-
-def _generate_module_with_ports(ios, name, ns, attr_translate, port_directions, port_wires):
+def _generate_module_with_ports(f, ios, name, ns, attr_translate, port_directions, port_wires, regs_init):
+    sync_targets = set()
+    if regs_init:
+        for stmts in f.sync.values():
+            sync_targets.update(list_targets(stmts))
     r = f"module {name} (\n"
     firstp = True
     for sig in sorted(ios, key=lambda x: ns.get_name(x)):
@@ -446,6 +423,8 @@ def _generate_module_with_ports(ios, name, ns, attr_translate, port_directions, 
             else:
                 sig.type = "reg"
                 r += _tab + "output reg  " + _generate_signal(ns, sig)
+                if sig in sync_targets:
+                    r += " = " + _generate_expression(ns, sig.reset)[0]
         else:
             sig.direction = "input"
             r += _tab + "input  wire " + _generate_signal(ns, sig)
@@ -1541,6 +1520,8 @@ def _convert_hierarchical(f, ios, name, platform, special_overrides, attr_transl
         parts = []
         parts.append(_generate_separator(f"Module: {node.module_name}"))
         parts.append(_generate_module_with_ports(
+            f=node.fragment,
+            regs_init=ctx.regs_init,
             ios=sorted(node.external_signals, key=lambda x: ctx.ns.get_name(x)),
             name=node.module_name,
             ns=ctx.ns,
@@ -1666,7 +1647,7 @@ def convert(f, ios=set(), name="top", platform=None,
 
     # Module Definition.
     verilog += _generate_separator("Module")
-    verilog += _generate_module(f, ios, name, ns, attr_translate)
+    verilog += _generate_module(f, ios, name, ns, attr_translate, regs_init)
 
     # Module Hierarchy.
     verilog += _generate_separator("Hierarchy")
